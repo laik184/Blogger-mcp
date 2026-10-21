@@ -58,8 +58,8 @@ function stableHash(value) {
   return sha256(JSON.stringify(value, Object.keys(value).sort()));
 }
 
-function bindAuthorizedContext(db, context) {
-  const connection = getGoogleConnection(db);
+async function bindAuthorizedContext(db, context) {
+  const connection = await getGoogleConnection(db);
   const googleSub = requireGoogleSub(context);
   const boundBlogId = context?.http?.authInfo?.extra?.blogId;
   if (!connection?.setup_complete || !connection.blog_id || !googleSub ||
@@ -69,18 +69,18 @@ function bindAuthorizedContext(db, context) {
   return connection;
 }
 
-function requireToolAuth(db, config, context, scope) {
+async function requireToolAuth(db, config, context, scope) {
   const scopeError = requireScope(context, scope, config);
   if (scopeError) return { error: scopeError };
   try {
-    return { connection: bindAuthorizedContext(db, context) };
+    return { connection: await bindAuthorizedContext(db, context) };
   } catch (error) {
     return { error: toolError(error.message) };
   }
 }
 
 function logTool(db, name, status, connection, postId, detail = null) {
-  writeAudit(db, { event: 'tool_call', toolName: name, status, blogId: connection?.blog_id || null, postId, detail });
+  return writeAudit(db, { event: 'tool_call', toolName: name, status, blogId: connection?.blog_id || null, postId, detail });
 }
 
 async function listPostsInternal(db, config, connection, { statuses = ['LIVE', 'DRAFT', 'SCHEDULED'], maxResults = 50, pageToken, fetchBodies = true } = {}) {
@@ -155,34 +155,54 @@ function validateIdempotencyKey(value) {
   if (!/^[A-Za-z0-9._:-]{8,128}$/.test(value)) throw new Error('idempotency_key must contain 8–128 letters, numbers, dots, underscores, colons, or hyphens.');
 }
 
-function beginIdempotency(db, blogId, key, requestHash) {
-  const transaction = db.transaction(() => {
-    const existing = db.prepare('SELECT * FROM idempotency WHERE blog_id=? AND idempotency_key=?').get(blogId, key);
+async function beginIdempotency(db, blogId, key, requestHash) {
+  const recordKey = `${blogId}:${key}`;
+  const lock = await db.insert('idempotency_locks', recordKey, { started_at: new Date().toISOString() });
+  if (!lock) return { pending: true };
+  try {
+    const existing = await db.get('idempotency', recordKey);
     if (existing && existing.request_hash !== requestHash) throw new Error('This idempotency_key was already used with different post content.');
-    if (existing?.state === 'succeeded') return { replay: true, existing };
-    if (existing?.state === 'in_progress') return { pending: true, existing };
-    if (existing?.uncertain) return { uncertain: true, existing };
-    const priorFailed = existing?.state === 'failed';
-    if (existing) {
-      db.prepare(`UPDATE idempotency SET state='in_progress',uncertain=0,updated_at=? WHERE blog_id=? AND idempotency_key=?`)
-        .run(new Date().toISOString(), blogId, key);
-    } else {
-      db.prepare(`INSERT INTO idempotency(blog_id,idempotency_key,request_hash,state,updated_at)
-        VALUES(?,?,?,'in_progress',?)`).run(blogId, key, requestHash, new Date().toISOString());
+    if (existing?.state === 'succeeded') {
+      await db.delete('idempotency_locks', recordKey);
+      return { replay: true, existing };
     }
-    return { replay: false, priorFailed: Boolean(priorFailed), existing };
+    if (existing?.state === 'in_progress') {
+      await db.delete('idempotency_locks', recordKey);
+      return { pending: true, existing };
+    }
+    if (existing?.uncertain) {
+      await db.delete('idempotency_locks', recordKey);
+      return { uncertain: true, existing };
+    }
+    const priorFailed = existing?.state === 'failed';
+    await db.put('idempotency', recordKey, {
+      ...(existing || {}), request_hash: requestHash, state: 'in_progress', uncertain: false,
+      updated_at: new Date().toISOString(), blog_id: blogId, idempotency_key: key,
+    });
+    return { replay: false, priorFailed: Boolean(priorFailed), existing, recordKey };
+  } catch (error) {
+    await db.delete('idempotency_locks', recordKey);
+    throw error;
+  }
+}
+
+async function finishIdempotency(db, blogId, key, result) {
+  const recordKey = `${blogId}:${key}`;
+  const existing = await db.get('idempotency', recordKey);
+  await db.put('idempotency', recordKey, {
+    ...existing, state: 'succeeded', uncertain: false, post_id: result.id,
+    post_url: result.url || null, updated_at: new Date().toISOString(),
   });
-  return transaction();
+  await db.delete('idempotency_locks', recordKey);
 }
 
-function finishIdempotency(db, blogId, key, result) {
-  db.prepare(`UPDATE idempotency SET state='succeeded',uncertain=0,post_id=?,post_url=?,updated_at=?
-    WHERE blog_id=? AND idempotency_key=?`).run(result.id, result.url || null, new Date().toISOString(), blogId, key);
-}
-
-function failIdempotency(db, blogId, key, uncertain = false) {
-  db.prepare(`UPDATE idempotency SET state='failed',uncertain=?,updated_at=? WHERE blog_id=? AND idempotency_key=?`)
-    .run(uncertain ? 1 : 0, new Date().toISOString(), blogId, key);
+async function failIdempotency(db, blogId, key, uncertain = false) {
+  const recordKey = `${blogId}:${key}`;
+  const existing = await db.get('idempotency', recordKey);
+  await db.put('idempotency', recordKey, {
+    ...existing, state: 'failed', uncertain: Boolean(uncertain), updated_at: new Date().toISOString(),
+  });
+  await db.delete('idempotency_locks', recordKey);
 }
 
 export function buildMcpServer(db, config) {
@@ -200,14 +220,14 @@ export function buildMcpServer(db, config) {
     _meta: { securitySchemes: [{ type: 'oauth2', scopes: ['blogger.read'] }] },
     scopeChallenge: requireScopes('blogger.read'),
   }, async (_args, context) => {
-    const auth = requireToolAuth(db, config, context, 'blogger.read');
+    const auth = await requireToolAuth(db, config, context, 'blogger.read');
     if (auth.error) return auth.error;
     try {
       const blogs = await listAuthorizedBlogs(db, config);
-      logTool(db, 'list_blogs', 'ok', auth.connection);
+      await logTool(db, 'list_blogs', 'ok', auth.connection);
       return jsonResult({ blogs, authorized_google_account: auth.connection.email });
     } catch (error) {
-      logTool(db, 'list_blogs', 'error', auth.connection, null, error.message);
+      await logTool(db, 'list_blogs', 'error', auth.connection, null, error.message);
       return toolError(error.message);
     }
   });
@@ -225,7 +245,7 @@ export function buildMcpServer(db, config) {
     _meta: { securitySchemes: [{ type: 'oauth2', scopes: ['blogger.read'] }] },
     scopeChallenge: requireScopes('blogger.read'),
   }, async ({ status, max_results, page_token, fetch_bodies }, context) => {
-    const auth = requireToolAuth(db, config, context, 'blogger.read');
+    const auth = await requireToolAuth(db, config, context, 'blogger.read');
     if (auth.error) return auth.error;
     try {
       const response = await listPostsInternal(db, config, auth.connection, {
@@ -235,10 +255,10 @@ export function buildMcpServer(db, config) {
         fetchBodies: fetch_bodies,
       });
       const result = { posts: (response.items || []).map(toSummary), next_page_token: response.nextPageToken || null, blog_id: auth.connection.blog_id };
-      logTool(db, 'list_posts', 'ok', auth.connection);
+      await logTool(db, 'list_posts', 'ok', auth.connection);
       return jsonResult(result);
     } catch (error) {
-      logTool(db, 'list_posts', 'error', auth.connection, null, error.message);
+      await logTool(db, 'list_posts', 'error', auth.connection, null, error.message);
       return toolError(error.message);
     }
   });
@@ -251,14 +271,14 @@ export function buildMcpServer(db, config) {
     _meta: { securitySchemes: [{ type: 'oauth2', scopes: ['blogger.read'] }] },
     scopeChallenge: requireScopes('blogger.read'),
   }, async ({ post_id }, context) => {
-    const auth = requireToolAuth(db, config, context, 'blogger.read');
+    const auth = await requireToolAuth(db, config, context, 'blogger.read');
     if (auth.error) return auth.error;
     try {
       const post = await bloggerRequest(db, config, { path: `/blogs/${encodeURIComponent(auth.connection.blog_id)}/posts/${encodeURIComponent(post_id)}` });
-      logTool(db, 'get_post', 'ok', auth.connection, post_id);
+      await logTool(db, 'get_post', 'ok', auth.connection, post_id);
       return jsonResult(toSummary(post, true));
     } catch (error) {
-      logTool(db, 'get_post', 'error', auth.connection, post_id, error.message);
+      await logTool(db, 'get_post', 'error', auth.connection, post_id, error.message);
       return toolError(error.message);
     }
   });
@@ -271,14 +291,14 @@ export function buildMcpServer(db, config) {
     _meta: { securitySchemes: [{ type: 'oauth2', scopes: ['blogger.read'] }] },
     scopeChallenge: requireScopes('blogger.read'),
   }, async ({ query, max_results }, context) => {
-    const auth = requireToolAuth(db, config, context, 'blogger.read');
+    const auth = await requireToolAuth(db, config, context, 'blogger.read');
     if (auth.error) return auth.error;
     try {
       const result = await searchPostsInternal(db, config, auth.connection, query, max_results);
-      logTool(db, 'search_existing_posts', 'ok', auth.connection);
+      await logTool(db, 'search_existing_posts', 'ok', auth.connection);
       return jsonResult({ ...result, blog_id: auth.connection.blog_id });
     } catch (error) {
-      logTool(db, 'search_existing_posts', 'error', auth.connection, null, error.message);
+      await logTool(db, 'search_existing_posts', 'error', auth.connection, null, error.message);
       return toolError(error.message);
     }
   });
@@ -296,34 +316,34 @@ export function buildMcpServer(db, config) {
     _meta: { securitySchemes: [{ type: 'oauth2', scopes: ['blogger.write'] }] },
     scopeChallenge: requireScopes('blogger.write'),
   }, async ({ title, content_html, labels, idempotency_key }, context) => {
-    const auth = requireToolAuth(db, config, context, 'blogger.write');
+    const auth = await requireToolAuth(db, config, context, 'blogger.write');
     if (auth.error) return auth.error;
     const requestHash = stableHash({ title: title.trim(), content_html, labels: [...labels].sort() });
     let idempotencyStarted = false;
     let postInsertStarted = false;
     try {
       validateIdempotencyKey(idempotency_key);
-      const idempotency = beginIdempotency(db, auth.connection.blog_id, idempotency_key, requestHash);
+      const idempotency = await beginIdempotency(db, auth.connection.blog_id, idempotency_key, requestHash);
       idempotencyStarted = !idempotency.replay && !idempotency.pending;
       if (idempotency.replay) {
-        logTool(db, 'create_draft', 'replayed', auth.connection, idempotency.existing.post_id);
+        await logTool(db, 'create_draft', 'replayed', auth.connection, idempotency.existing.post_id);
         return jsonResult({ created: false, replayed: true, id: idempotency.existing.post_id, url: idempotency.existing.post_url, status: 'DRAFT' });
       }
       if (idempotency.pending) return toolError('This idempotency_key is already being processed. Retry after the current request finishes.');
       if (idempotency.uncertain) {
-        logTool(db, 'create_draft', 'uncertain_retry_blocked', auth.connection);
+        await logTool(db, 'create_draft', 'uncertain_retry_blocked', auth.connection);
         return toolError('A previous create_draft request with this key may have reached Blogger, but its post ID was not verified. No second create request was sent. Search existing posts and check Blogger manually; use a new key only after confirming no draft was created.');
       }
 
       const duplicateCheck = await findDuplicate(db, config, auth.connection, title, content_html);
       const duplicate = duplicateCheck.duplicate;
       if (duplicate) {
-        failIdempotency(db, auth.connection.blog_id, idempotency_key);
-        logTool(db, 'create_draft', 'duplicate_blocked', auth.connection, duplicate.id);
+        await failIdempotency(db, auth.connection.blog_id, idempotency_key);
+        await logTool(db, 'create_draft', 'duplicate_blocked', auth.connection, duplicate.id);
         return toolError(`A post with the same title already exists (${duplicate.status}, post ID ${duplicate.id}). Review it with get_post before creating another draft.`, { duplicate });
       }
       if (duplicateCheck.capped) {
-        failIdempotency(db, auth.connection.blog_id, idempotency_key);
+        await failIdempotency(db, auth.connection.blog_id, idempotency_key);
         return toolError(`Duplicate scan reached the ${duplicateCheck.scanned}-post safety limit. No draft was created because the full blog could not be checked.`);
       }
 
@@ -340,12 +360,12 @@ export function buildMcpServer(db, config) {
         throw new Error('Draft creation returned a post ID, but status verification did not confirm DRAFT. Do not retry with a new idempotency key.');
       }
       const result = toSummary(verified);
-      finishIdempotency(db, auth.connection.blog_id, idempotency_key, result);
-      logTool(db, 'create_draft', 'ok', auth.connection, verified.id);
+      await finishIdempotency(db, auth.connection.blog_id, idempotency_key, result);
+      await logTool(db, 'create_draft', 'ok', auth.connection, verified.id);
       return jsonResult({ created: true, ...result });
     } catch (error) {
-      if (idempotencyStarted) failIdempotency(db, auth.connection.blog_id, idempotency_key, postInsertStarted);
-      logTool(db, 'create_draft', 'error', auth.connection, null, error.message);
+      if (idempotencyStarted) await failIdempotency(db, auth.connection.blog_id, idempotency_key, postInsertStarted);
+      await logTool(db, 'create_draft', 'error', auth.connection, null, error.message);
       return toolError(error instanceof GoogleApiError ? `Blogger API error (${error.status}): ${error.message}` : error.message);
     }
   });
@@ -364,13 +384,13 @@ export function buildMcpServer(db, config) {
     _meta: { securitySchemes: [{ type: 'oauth2', scopes: ['blogger.write'] }] },
     scopeChallenge: requireScopes('blogger.write'),
   }, async ({ post_id, title, content_html, labels, idempotency_key }, context) => {
-    const auth = requireToolAuth(db, config, context, 'blogger.write');
+    const auth = await requireToolAuth(db, config, context, 'blogger.write');
     if (auth.error) return auth.error;
     let idempotencyStarted = false;
     try {
       validateIdempotencyKey(idempotency_key);
       const requestHash = stableHash({ action: 'update', post_id, title: title.trim(), content_html, labels: [...labels].sort() });
-      const idempotency = beginIdempotency(db, auth.connection.blog_id, idempotency_key, requestHash);
+      const idempotency = await beginIdempotency(db, auth.connection.blog_id, idempotency_key, requestHash);
       idempotencyStarted = !idempotency.replay && !idempotency.pending;
       if (idempotency.replay) {
         const replayPost = await bloggerRequest(db, config, { path: `/blogs/${encodeURIComponent(auth.connection.blog_id)}/posts/${encodeURIComponent(post_id)}` });
@@ -380,16 +400,16 @@ export function buildMcpServer(db, config) {
       if (idempotency.pending) return toolError('This draft update is already being processed. Retry after the current request finishes.');
       const current = await bloggerRequest(db, config, { path: `/blogs/${encodeURIComponent(auth.connection.blog_id)}/posts/${encodeURIComponent(post_id)}` });
       if (current.status !== 'DRAFT') {
-        failIdempotency(db, auth.connection.blog_id, idempotency_key);
+        await failIdempotency(db, auth.connection.blog_id, idempotency_key);
         return toolError(`Refusing update: post ${post_id} has status ${current.status || 'UNKNOWN'}, not DRAFT.`);
       }
       const duplicateCheck = await findDuplicate(db, config, auth.connection, title, content_html, post_id);
       if (duplicateCheck.duplicate) {
-        failIdempotency(db, auth.connection.blog_id, idempotency_key);
+        await failIdempotency(db, auth.connection.blog_id, idempotency_key);
         return toolError(`Another post has the same title or article body (${duplicateCheck.duplicate.status}, post ID ${duplicateCheck.duplicate.id}).`);
       }
       if (duplicateCheck.capped) {
-        failIdempotency(db, auth.connection.blog_id, idempotency_key);
+        await failIdempotency(db, auth.connection.blog_id, idempotency_key);
         return toolError(`Duplicate scan reached the ${duplicateCheck.scanned}-post safety limit. No draft was updated.`);
       }
       const updated = await bloggerRequest(db, config, {
@@ -401,12 +421,12 @@ export function buildMcpServer(db, config) {
       if (String(verified.id) !== String(updated.id || post_id) || verified.status !== 'DRAFT') {
         throw new Error('Draft update was not verified as a Blogger draft.');
       }
-      finishIdempotency(db, auth.connection.blog_id, idempotency_key, toSummary(verified));
-      logTool(db, 'update_draft', 'ok', auth.connection, post_id);
+      await finishIdempotency(db, auth.connection.blog_id, idempotency_key, toSummary(verified));
+      await logTool(db, 'update_draft', 'ok', auth.connection, post_id);
       return jsonResult({ ...toSummary(verified), draft_updated: true });
     } catch (error) {
-      if (idempotencyStarted) failIdempotency(db, auth.connection.blog_id, idempotency_key);
-      logTool(db, 'update_draft', 'error', auth.connection, post_id, error.message);
+      if (idempotencyStarted) await failIdempotency(db, auth.connection.blog_id, idempotency_key);
+      await logTool(db, 'update_draft', 'error', auth.connection, post_id, error.message);
       return toolError(error instanceof GoogleApiError ? `Blogger API error (${error.status}): ${error.message}` : error.message);
     }
   });
@@ -423,7 +443,7 @@ export function buildMcpServer(db, config) {
     _meta: { securitySchemes: [{ type: 'oauth2', scopes: ['blogger.write'] }] },
     scopeChallenge: requireScopes('blogger.write'),
   }, async ({ post_id, idempotency_key, approval_phrase }, context) => {
-    const auth = requireToolAuth(db, config, context, 'blogger.write');
+    const auth = await requireToolAuth(db, config, context, 'blogger.write');
     if (auth.error) return auth.error;
     if (!config.publishEnabled) return toolError('Public publishing is disabled on this server. Keep the post as a draft.');
     if (approval_phrase !== 'I APPROVE PUBLICATION') return toolError('Explicit publication approval is required.');
@@ -431,7 +451,7 @@ export function buildMcpServer(db, config) {
     try {
       validateIdempotencyKey(idempotency_key);
       const requestHash = stableHash({ post_id, action: 'publish' });
-      const idempotency = beginIdempotency(db, auth.connection.blog_id, idempotency_key, requestHash);
+      const idempotency = await beginIdempotency(db, auth.connection.blog_id, idempotency_key, requestHash);
       idempotencyStarted = !idempotency.replay && !idempotency.pending;
       if (idempotency.replay) return jsonResult({ published_now: true, replayed: true, id: idempotency.existing.post_id, url: idempotency.existing.post_url, status: 'LIVE' });
       if (idempotency.pending) return toolError('This publish request is already being processed. Check get_post_status before retrying.');
@@ -440,10 +460,10 @@ export function buildMcpServer(db, config) {
       if (current.status !== 'DRAFT') {
         if (current.status === 'LIVE') {
           const alreadyLive = toSummary(current);
-          finishIdempotency(db, auth.connection.blog_id, idempotency_key, alreadyLive);
+          await finishIdempotency(db, auth.connection.blog_id, idempotency_key, alreadyLive);
           return jsonResult({ ...alreadyLive, published_now: false, already_live: true });
         }
-        failIdempotency(db, auth.connection.blog_id, idempotency_key);
+        await failIdempotency(db, auth.connection.blog_id, idempotency_key);
         return toolError(`Refusing publish: post ${post_id} has status ${current.status || 'UNKNOWN'}, not DRAFT.`);
       }
       const result = await bloggerRequest(db, config, {
@@ -455,12 +475,12 @@ export function buildMcpServer(db, config) {
       });
       if (verified.status !== 'LIVE' || !verified.url) throw new Error('Blogger did not verify the post as LIVE with a public URL.');
       const summary = toSummary(verified);
-      finishIdempotency(db, auth.connection.blog_id, idempotency_key, summary);
-      logTool(db, 'publish_draft', 'ok', auth.connection, post_id);
+      await finishIdempotency(db, auth.connection.blog_id, idempotency_key, summary);
+      await logTool(db, 'publish_draft', 'ok', auth.connection, post_id);
       return jsonResult({ ...summary, published_now: true, published_url: verified.url });
     } catch (error) {
-      if (idempotencyStarted) failIdempotency(db, auth.connection.blog_id, idempotency_key);
-      logTool(db, 'publish_draft', 'error', auth.connection, post_id, error.message);
+      if (idempotencyStarted) await failIdempotency(db, auth.connection.blog_id, idempotency_key);
+      await logTool(db, 'publish_draft', 'error', auth.connection, post_id, error.message);
       return toolError(error instanceof GoogleApiError ? `Blogger API error (${error.status}): ${error.message}` : error.message);
     }
   });
@@ -473,15 +493,15 @@ export function buildMcpServer(db, config) {
     _meta: { securitySchemes: [{ type: 'oauth2', scopes: ['blogger.read'] }] },
     scopeChallenge: requireScopes('blogger.read'),
   }, async ({ post_id }, context) => {
-    const auth = requireToolAuth(db, config, context, 'blogger.read');
+    const auth = await requireToolAuth(db, config, context, 'blogger.read');
     if (auth.error) return auth.error;
     try {
       const post = await bloggerRequest(db, config, { path: `/blogs/${encodeURIComponent(auth.connection.blog_id)}/posts/${encodeURIComponent(post_id)}` });
       const result = { id: String(post.id), status: post.status || 'UNKNOWN', url: post.url || null, updated: post.updated || null, published: post.published || null };
-      logTool(db, 'get_post_status', 'ok', auth.connection, post_id);
+      await logTool(db, 'get_post_status', 'ok', auth.connection, post_id);
       return jsonResult(result);
     } catch (error) {
-      logTool(db, 'get_post_status', 'error', auth.connection, post_id, error.message);
+      await logTool(db, 'get_post_status', 'error', auth.connection, post_id, error.message);
       return toolError(error.message);
     }
   });
