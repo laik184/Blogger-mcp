@@ -22,7 +22,7 @@ Google's Blogger API uses the Blogger OAuth scope for private blog reads and wri
 - Node.js 20 or newer for local use. The Dockerfile uses Node 24.
 - A Google Cloud project with Blogger API v3 enabled and a Google OAuth 2.0 **Web application** client.
 - A publicly reachable HTTPS host with durable storage for SQLite. The provided Render Blueprint uses a persistent disk. Keep the encryption key and database backup together; losing the encryption key makes stored Google tokens unreadable.
-- A ChatGPT Business, Enterprise, or Edu workspace with permission to add custom MCP servers for write actions. ChatGPT Plus cannot connect a custom MCP server; Pro currently has read/fetch-only custom MCP access.
+- A ChatGPT account/workspace where custom MCP servers and the required write actions are enabled by its current plan and workspace policy. OpenAI availability can vary by account and workspace; check the current ChatGPT web app and workspace settings.
 
 ## Local run
 
@@ -144,6 +144,6 @@ No real Google OAuth was completed and no live Blogger draft was created during 
 
 - **Google says redirect URI mismatch:** the Cloud Console callback must exactly match `GOOGLE_REDIRECT_URI`, including scheme, hostname, and path.
 - **OAuth consent says app is unverified:** keep the Google OAuth app in Testing and add the account as a test user, or complete Google's verification process for broader access.
-- **ChatGPT cannot discover tools:** confirm the endpoint is public HTTPS, `/healthz` is healthy, `/mcp` is set as the endpoint, and OAuth metadata endpoints respond. Ensure your ChatGPT plan/workspace permits the required custom MCP actions.
+- **ChatGPT cannot discover tools:** confirm the endpoint is public HTTPS, `/healthz` is healthy, `/mcp` is set as the endpoint, and OAuth metadata endpoints respond. Ensure custom MCP and its required actions are allowed by the current account/workspace settings.
 - **Draft operation reports an uncertain previous result:** use `search_existing_posts` and inspect Blogger. The server intentionally will not retry a create request that might already have succeeded.
 - **Google access is revoked:** reconnect at `/setup` with the setup secret, sign into the same Google account, and re-confirm the bound blog remains accessible.
