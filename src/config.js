@@ -50,7 +50,7 @@ export function loadConfig() {
   return Object.freeze({
     nodeEnv: process.env.NODE_ENV || 'development',
     production: process.env.NODE_ENV === 'production',
-    port: Number(process.env.PORT || 3000),
+    port: Number(process.env.X_ZOHO_CATALYST_LISTEN_PORT || process.env.PORT || 3000),
     publicBaseUrl,
     issuer: publicBaseUrl,
     resource: `${publicBaseUrl}/mcp`,
