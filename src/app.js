@@ -27,6 +27,10 @@ export function createApp(config, db) {
     next();
   });
 
+  if (db.kind === 'catalyst') {
+    app.use((req, _res, next) => db.runWithRequest(req, next));
+  }
+
   const oauthLimiter = rateLimit({ windowMs: 60_000, limit: 20, standardHeaders: true, legacyHeaders: false });
   const setupLimiter = rateLimit({ windowMs: 15 * 60_000, limit: 8, standardHeaders: true, legacyHeaders: false });
   app.use('/oauth', oauthLimiter);
@@ -34,13 +38,14 @@ export function createApp(config, db) {
   app.use('/setup/reconnect', setupLimiter);
   app.use('/', createOAuthRouter(db, config));
 
-  app.get('/healthz', (_req, res) => {
-    const connection = getGoogleConnection(db);
+  app.get('/healthz', async (_req, res) => {
+    const connection = await getGoogleConnection(db);
     res.json({
       status: 'ok',
       app: 'Blogger AI Publisher',
       setup_complete: Boolean(connection?.setup_complete),
       publishing_enabled: config.publishEnabled,
+      database: db.kind,
     });
   });
 
