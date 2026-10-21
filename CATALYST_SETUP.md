@@ -8,9 +8,9 @@ In the Catalyst project, open **Serverless → Cloud Scale → Data Store** (the
 
 | Column | Type | Size | Required settings |
 |---|---|---:|---|
-| `RecordKey` | VarChar | 255 characters | Mandatory; Unique |
-| `Collection` | VarChar | 64 characters | Mandatory |
-| `LogicalKey` | VarChar | 255 characters | Mandatory |
+| `RecordKey` | Var Char | 255 characters | Mandatory; Unique |
+| `Collection` | Var Char | 64 characters | Mandatory |
+| `LogicalKey` | Var Char | 255 characters | Mandatory |
 | `PayloadEnc` | Text | Maximum 10,000 characters | Mandatory |
 
 `RecordKey` is the unique index used for safe one-time OAuth and draft-idempotency claims. `PayloadEnc` holds application-level AES-256-GCM ciphertext. Do not change column names or use Catalyst Encrypted Text: the app encrypts this field itself with `TOKEN_ENCRYPTION_KEY`.
