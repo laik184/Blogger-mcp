@@ -4,7 +4,9 @@
   "private": true,
   "type": "module",
   "description": "Private MCP server for reading and managing Blogger posts through Blogger API v3.",
-  "engines": { "node": ">=20" },
+  "engines": {
+    "node": ">=20"
+  },
   "scripts": {
     "start": "node src/index.js",
     "dev": "node --watch src/index.js",
@@ -15,7 +17,8 @@
     "@modelcontextprotocol/express": "2.0.2",
     "@modelcontextprotocol/node": "2.1.1",
     "@modelcontextprotocol/server": "2.3.1",
-    "better-sqlite3": "^12.4.1",
+    "@zcatalyst/auth": "^1.0.0",
+    "@zcatalyst/datastore": "^1.0.0",
     "cookie-parser": "^1.4.7",
     "express": "^5.1.0",
     "express-rate-limit": "^8.1.0",
@@ -24,6 +27,7 @@
     "zod": "^4.2.0"
   },
   "devDependencies": {
-    "@modelcontextprotocol/client": "2.3.1"
+    "@modelcontextprotocol/client": "2.3.1",
+    "better-sqlite3": "^13.0.3"
   }
 }
