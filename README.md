@@ -6,7 +6,7 @@ A private MCP server that connects ChatGPT to one Blogger blog through the offic
 
 - MCP v2 server at `/mcp` using Streamable HTTP. It serves the current `2026-07-28` protocol and stateless compatibility for clients still using the 2025 handshake.
 - Google OAuth setup and reconnect flow using the `https://www.googleapis.com/auth/blogger` scope.
-- AES-256-GCM encrypted Google credentials in SQLite. MCP access and refresh tokens are stored as hashes.
+- AES-256-GCM encrypted Google credentials in SQLite locally/Render or Catalyst Data Store on AppSail. MCP access and refresh tokens are stored as hashes.
 - One Google identity and one selected Blog ID are bound during setup. Tool arguments cannot change the Blog ID.
 - Tools: `list_blogs`, `list_posts`, `get_post`, `search_existing_posts`, `create_draft`, `update_draft`, `publish_draft`, and `get_post_status`.
 - Duplicate checks across live, draft, and scheduled posts; write idempotency; audit/error records; and read-after-write verification.
@@ -85,14 +85,18 @@ The Blueprint in `render.yaml` creates a Node web service and a 1 GB persistent 
 8. Open `https://YOUR-RENDER-HOST/setup`, enter `SETUP_ADMIN_SECRET`, sign into Google, and select the one allowed Blogger blog. The browser flow checks the Google identity, binds the Blog ID, and stores the refresh token encrypted on the server.
 9. If Google later revokes access, open `/setup` and use **Reconnect this Google account**. The reconnect flow requires the setup secret and the same Google identity, and checks that the originally bound Blog ID is still accessible before replacing tokens.
 
+## Deploy on Zoho Catalyst AppSail
+
+For the Zoho Catalyst AppSail upload, follow [`CATALYST_SETUP.md`](./CATALYST_SETUP.md). It includes the exact managed-runtime form values, the persistent `BAPStore` Data Store schema, required environment variables, and the upload archive build contents. Set `DATABASE_BACKEND=catalyst`; do not use SQLite for AppSail because service instances can scale independently. Publishing remains disabled during the setup and draft test.
+
 ## Connect to ChatGPT
 
-This server cannot be connected from the current saved ChatGPT Plus plan. OpenAI's [custom MCP server availability](https://help.openai.com/en/articles/12584461-connecting-custom-mcp-servers-in-chatgpt) lists Business and Enterprise/Edu for full MCP; Pro currently has read/fetch-only custom MCP access. For an eligible Business workspace, an admin/owner can connect it from ChatGPT web. Enterprise/Edu workspaces require an admin or a member authorized through workspace RBAC.
+OpenAI's current [custom MCP guide](https://developers.openai.com/api/docs/guides/custom-mcp-server) says ChatGPT supports both read and write tools from a custom MCP server. Actual availability depends on the account and workspace permissions, so check whether **Add custom MCP server** appears in ChatGPT web and whether the workspace allows it. A tool call that writes data requires confirmation by default; workspace action controls can also limit available tools.
 
-On an eligible workspace, follow OpenAI's [custom MCP server connection guide](https://developers.openai.com/api/docs/guides/custom-mcp-server):
+When the server is deployed and connected, follow the current guide:
 
 1. Open ChatGPT on the web → **Plugins** → **+** → **Add custom MCP server**.
-2. Name it **Blogger AI Publisher** and set the connection URL to `https://YOUR-RENDER-HOST/mcp`.
+2. Name it **Blogger AI Publisher** and set the connection URL to `https://YOUR-APPSAIL-URL/mcp` (or the selected host's URL plus `/mcp`).
 3. Select OAuth authentication. ChatGPT should discover the authorization server metadata, use dynamic client registration, and open Google's sign-in consent flow through this server.
 4. Review the risk warning, create the plugin, and inspect the discovered tools. Leave `publish_draft` disabled in ChatGPT action controls if those controls are available. The server-side `PUBLISH_ENABLED=false` lock is authoritative regardless of ChatGPT settings.
 5. In a chat, select or `@mention` Blogger AI Publisher and test `list_blogs`, `list_posts`, and `get_post_status`. Then ask for one draft and verify the returned ID and `DRAFT` status in Blogger.
@@ -128,7 +132,7 @@ To enable publishing later, set `PUBLISH_ENABLED=true` in Render and redeploy. T
 
 ## Daily workflow prompt
 
-The prompt is in [`DAILY_WORKFLOW.md`](./DAILY_WORKFLOW.md). It is a ready-to-use instruction for an eligible interactive ChatGPT connector. An 8:00 AM Asia/Kolkata ChatGPT task has **not** been created: the current Plus account cannot use the custom Blogger MCP write tool, and scheduled tasks only work with supported apps. Tasks that require approval pause for review. Until both custom-app access and scheduled MCP actions are available in the account/workspace, run the workflow manually; do not rely on an unattended Blogger draft or publish.
+The prompt is in [`DAILY_WORKFLOW.md`](./DAILY_WORKFLOW.md). OpenAI's [scheduled tasks guide](https://learn.chatgpt.com/docs/automations) says tasks can use plugins, but availability depends on the plan and workspace settings; unattended execution also follows workspace approval policy. This project has not created an 8:00 AM Asia/Kolkata task. First connect the plugin and test draft creation manually. Keep `PUBLISH_ENABLED=false`: even if a scheduled task is available, this server cannot publish while that lock is off.
 
 ## Tests and limits
 
