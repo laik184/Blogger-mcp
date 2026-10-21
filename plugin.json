@@ -1,0 +1,23 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "blogger-ai-publisher",
+  "version": "1.0.0",
+  "description": "Connect ChatGPT to one authorized Blogger blog for reading, drafting, verification, and explicitly permitted publishing.",
+  "author": { "name": "Private installation" },
+  "extensions": {
+    "com.openai": {
+      "interface": {
+        "displayName": "Blogger AI Publisher",
+        "shortDescription": "Read and create Blogger drafts",
+        "longDescription": "ChatGPT handles research, fact checking, SEO writing, and decisions. This private MCP server only reads and manages Blogger posts.",
+        "developerName": "Private installation",
+        "category": "Productivity",
+        "capabilities": ["Read", "Write"],
+        "defaultPrompt": [
+          "Review recent posts in my authorized Blogger blog, find a nonduplicate topic, then prepare a researched article as a Blogger draft. Do not publish it."
+        ],
+        "brandColor": "#243B7A"
+      }
+    }
+  }
+}

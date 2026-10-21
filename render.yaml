@@ -1,0 +1,35 @@
+services:
+  - type: web
+    name: blogger-ai-publisher
+    runtime: node
+    plan: starter
+    region: singapore
+    buildCommand: npm ci --omit=dev
+    startCommand: npm start
+    healthCheckPath: /healthz
+    autoDeploy: false
+    disk:
+      name: blogger-ai-data
+      mountPath: /var/data
+      sizeGB: 1
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: DATABASE_PATH
+        value: /var/data/blogger-ai-publisher.sqlite
+      - key: PUBLIC_BASE_URL
+        sync: false
+      - key: GOOGLE_CLIENT_ID
+        sync: false
+      - key: GOOGLE_CLIENT_SECRET
+        sync: false
+      - key: GOOGLE_REDIRECT_URI
+        sync: false
+      - key: TOKEN_ENCRYPTION_KEY
+        sync: false
+      - key: SETUP_ADMIN_SECRET
+        sync: false
+      - key: CHATGPT_OAUTH_REDIRECT_URIS
+        value: https://chatgpt.com/connector_platform_oauth_redirect
+      - key: PUBLISH_ENABLED
+        value: "false"

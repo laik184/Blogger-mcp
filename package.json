@@ -1,0 +1,29 @@
+{
+  "name": "blogger-ai-publisher",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Private MCP server for reading and managing Blogger posts through Blogger API v3.",
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js",
+    "test": "node --test",
+    "check": "node --check src/index.js && node --check src/app.js && node --check src/oauth-server.js && node --check src/mcp-server.js && node --check src/google.js && node --check src/db.js && node --check src/config.js && node --check src/crypto.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/express": "2.0.2",
+    "@modelcontextprotocol/node": "2.1.1",
+    "@modelcontextprotocol/server": "2.3.1",
+    "better-sqlite3": "^12.4.1",
+    "cookie-parser": "^1.4.7",
+    "express": "^5.1.0",
+    "express-rate-limit": "^8.1.0",
+    "google-auth-library": "^11.3.1",
+    "helmet": "^8.1.0",
+    "zod": "^4.2.0"
+  },
+  "devDependencies": {
+    "@modelcontextprotocol/client": "2.3.1"
+  }
+}
