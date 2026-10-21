@@ -47,6 +47,11 @@ export function loadConfig() {
     throw new Error('GOOGLE_REDIRECT_URI must use HTTPS in production.');
   }
 
+  const databaseBackend = (process.env.DATABASE_BACKEND || 'sqlite').trim().toLowerCase();
+  if (!['sqlite', 'catalyst'].includes(databaseBackend)) {
+    throw new Error('DATABASE_BACKEND must be either sqlite or catalyst.');
+  }
+
   return Object.freeze({
     nodeEnv: process.env.NODE_ENV || 'development',
     production: process.env.NODE_ENV === 'production',
@@ -61,6 +66,7 @@ export function loadConfig() {
     encryptionKey,
     setupAdminSecret: required('SETUP_ADMIN_SECRET'),
     databasePath: path.resolve(process.env.DATABASE_PATH || './data/blogger-ai-publisher.sqlite'),
+    databaseBackend,
     allowedChatGptRedirectUris: new Set(redirectUris),
     publishEnabled: process.env.PUBLISH_ENABLED === 'true',
     maxPostsPerSearch: Math.max(10, Math.min(200, Number(process.env.MAX_POSTS_PER_SEARCH || 100))),
