@@ -48,18 +48,25 @@ test('MCP initialization, tool discovery, OAuth metadata, read, draft, idempoten
   const clientId = 'bap_test_client';
   const now = Math.floor(Date.now() / 1000);
 
-  db.prepare(`INSERT INTO google_connection(singleton,google_sub,email,display_name,refresh_token_enc,access_token_enc,token_expiry,blog_id,blog_name,blog_url,connected_at,setup_complete)
-    VALUES(1,?,?,?,?,?,?,?,?,?,?,1)`).run(
-    googleSub, 'publisher@example.com', 'Test Publisher', encryptText('refresh-token-for-test', encryptionKey),
-    encryptText(accessToken, encryptionKey), Date.now() + 60 * 60 * 1000, blogId, 'Test Blog', 'https://example.blogspot.com', new Date().toISOString(),
-  );
-  db.prepare('INSERT INTO oauth_clients(client_id,client_name,redirect_uris_json,created_at) VALUES(?,?,?,?)')
-    .run(clientId, 'Test ChatGPT', JSON.stringify(['https://chatgpt.com/connector_platform_oauth_redirect']), new Date().toISOString());
-  db.prepare(`INSERT INTO oauth_access_tokens(token_hash,client_id,google_sub,scope,resource,expires_at,created_at)
-    VALUES(?,?,?,?,?,?,?)`).run(sha256(mcpAccessToken), clientId, googleSub, 'blogger.read blogger.write offline_access', config.resource, now + 3600, new Date().toISOString());
+  await db.put('google_connection', 'singleton', {
+    google_sub: googleSub, email: 'publisher@example.com', display_name: 'Test Publisher',
+    refresh_token_enc: encryptText('refresh-token-for-test', encryptionKey),
+    access_token_enc: encryptText(accessToken, encryptionKey), token_expiry: Date.now() + 60 * 60 * 1000,
+    blog_id: blogId, blog_name: 'Test Blog', blog_url: 'https://example.blogspot.com',
+    connected_at: new Date().toISOString(), setup_complete: 1,
+  });
+  await db.insert('oauth_clients', clientId, {
+    client_id: clientId, client_name: 'Test ChatGPT', redirect_uris_json: JSON.stringify(['https://chatgpt.com/connector_platform_oauth_redirect']), created_at: new Date().toISOString(),
+  });
+  await db.insert('oauth_access_tokens', sha256(mcpAccessToken), {
+    client_id: clientId, google_sub: googleSub, scope: 'blogger.read blogger.write offline_access', resource: config.resource,
+    expires_at: now + 3600, created_at: new Date().toISOString(),
+  });
   const wrongGoogleToken = randomToken();
-  db.prepare(`INSERT INTO oauth_access_tokens(token_hash,client_id,google_sub,scope,resource,expires_at,created_at)
-    VALUES(?,?,?,?,?,?,?)`).run(sha256(wrongGoogleToken), clientId, 'different-google-account', 'blogger.read blogger.write', config.resource, now + 3600, new Date().toISOString());
+  await db.insert('oauth_access_tokens', sha256(wrongGoogleToken), {
+    client_id: clientId, google_sub: 'different-google-account', scope: 'blogger.read blogger.write', resource: config.resource,
+    expires_at: now + 3600, created_at: new Date().toISOString(),
+  });
 
   const posts = [];
   const realFetch = globalThis.fetch;
@@ -244,16 +251,19 @@ test('OAuth authorization codes are one-use, PKCE-bound, and resource-bound', as
   await once(server, 'listening');
   t.after(async () => { await new Promise(resolve => server.close(resolve)); db.close(); fs.rmSync(directory, { recursive: true, force: true }); });
 
-  db.prepare('INSERT INTO oauth_clients(client_id,client_name,redirect_uris_json,created_at) VALUES(?,?,?,?)')
-    .run('client-oauth-test', 'Test', JSON.stringify(['https://chatgpt.com/connector_platform_oauth_redirect']), new Date().toISOString());
+  await db.insert('oauth_clients', 'client-oauth-test', {
+    client_id: 'client-oauth-test', client_name: 'Test', redirect_uris_json: JSON.stringify(['https://chatgpt.com/connector_platform_oauth_redirect']), created_at: new Date().toISOString(),
+  });
   const code = randomToken();
   const verifier = randomToken(48);
   const challenge = createHash('sha256').update(verifier).digest('base64url');
   const sub = 'google-oauth-sub';
   const scope = 'blogger.read blogger.write offline_access';
   const now = Math.floor(Date.now() / 1000);
-  db.prepare(`INSERT INTO oauth_codes(code_hash,client_id,redirect_uri,google_sub,scope,code_challenge,resource,expires_at)
-    VALUES(?,?,?,?,?,?,?,?)`).run(sha256(code), 'client-oauth-test', 'https://chatgpt.com/connector_platform_oauth_redirect', sub, scope, challenge, config.resource, now + 300);
+  await db.insert('oauth_codes', sha256(code), {
+    code_hash: sha256(code), client_id: 'client-oauth-test', redirect_uri: 'https://chatgpt.com/connector_platform_oauth_redirect',
+    google_sub: sub, scope, code_challenge: challenge, resource: config.resource, expires_at: now + 300,
+  });
 
   const badVerifier = await fetch(`${config.publicBaseUrl}/oauth/token`, {
     method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' },
@@ -270,8 +280,8 @@ test('OAuth authorization codes are one-use, PKCE-bound, and resource-bound', as
   const tokens = await tokenResponse.json();
   assert.equal(tokens.token_type, 'Bearer');
   assert.ok(tokens.access_token && tokens.refresh_token);
-  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM oauth_access_tokens WHERE token_hash=?').get(sha256(tokens.access_token)).n, 1);
-  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM oauth_access_tokens WHERE token_hash=?').get(tokens.access_token).n, 0, 'raw token values are not stored');
+  assert.ok(await db.get('oauth_access_tokens', sha256(tokens.access_token)));
+  assert.equal(await db.get('oauth_access_tokens', tokens.access_token), null, 'raw token values are not stored');
 
   const reused = await fetch(`${config.publicBaseUrl}/oauth/token`, {
     method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' },
