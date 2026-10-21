@@ -3,7 +3,7 @@ import { createHash } from 'node:crypto';
 import { OAuthError, OAuthErrorCode } from '@modelcontextprotocol/server';
 import { mcpAuthMetadataRouter } from '@modelcontextprotocol/express';
 import { createGoogleOAuth, listBlogsWithAccessToken, refreshGoogleCredentials, upsertGoogleConnection, verifyGoogleIdentity } from './google.js';
-import { getGoogleConnection, setSetting, getSetting, writeAudit } from './db.js';
+import { deleteSetting, getGoogleConnection, setGoogleConnection, setSetting, getSetting, writeAudit } from './db.js';
 import { decryptText, randomToken, safeEqual, sha256 } from './crypto.js';
 
 const SCOPES = ['blogger.read', 'blogger.write', 'offline_access'];
@@ -41,12 +41,14 @@ function safeRedirect(target) {
   return new URL(target);
 }
 
-function cleanupExpired(db) {
+async function cleanupExpired(db) {
   const now = Math.floor(Date.now() / 1000);
-  db.prepare('DELETE FROM auth_flows WHERE expires_at < ?').run(now);
-  db.prepare('DELETE FROM oauth_codes WHERE expires_at < ?').run(now);
-  db.prepare('DELETE FROM oauth_access_tokens WHERE expires_at < ?').run(now);
-  db.prepare('DELETE FROM oauth_refresh_tokens WHERE expires_at < ?').run(now);
+  for (const collection of ['auth_flows', 'oauth_codes', 'oauth_access_tokens', 'oauth_refresh_tokens', 'used_auth_codes', 'used_refresh_tokens']) {
+    const rows = await db.list(collection);
+    for (const row of rows) {
+      if (Number(row.value.expires_at) < now) await db.delete(collection, row.key);
+    }
+  }
 }
 
 function allowedScopes(scopeText) {
@@ -79,15 +81,17 @@ function authRequestFromQuery(query, client, config) {
   return { clientId, redirectUri, state, challenge, scope: scopes.join(' '), resource };
 }
 
-function createGoogleFlow(db, config, res, purpose, request) {
+async function createGoogleFlow(db, config, res, purpose, request) {
   const oauth = createGoogleOAuth(config);
   const state = randomToken(32);
   const browser = randomToken(32);
   const isSetupFlow = purpose !== 'login';
   const cookie = isSetupFlow ? 'bap_setup_browser' : 'bap_login_browser';
   const now = Math.floor(Date.now() / 1000);
-  db.prepare(`INSERT INTO auth_flows(state_hash,browser_hash,purpose,request_json,expires_at)
-    VALUES(?,?,?,?,?)`).run(sha256(state), sha256(browser), purpose, request ? JSON.stringify(request) : null, now + 600);
+  await db.insert('auth_flows', sha256(state), {
+    state_hash: sha256(state), browser_hash: sha256(browser), purpose,
+    request_json: request ? JSON.stringify(request) : null, expires_at: now + 600,
+  });
   setBrowserCookie(res, cookie, browser, config);
   const scope = isSetupFlow ? GOOGLE_SETUP_SCOPES : GOOGLE_IDENTITY_SCOPES;
   const url = oauth.generateAuthUrl({
@@ -101,12 +105,14 @@ function createGoogleFlow(db, config, res, purpose, request) {
   return url;
 }
 
-function appendAuthorizationCode(db, config, request, googleSub, res) {
+async function appendAuthorizationCode(db, config, request, googleSub, res) {
   const code = randomToken(32);
   const now = Math.floor(Date.now() / 1000);
-  db.prepare(`INSERT INTO oauth_codes(code_hash,client_id,redirect_uri,google_sub,scope,code_challenge,resource,expires_at)
-    VALUES(?,?,?,?,?,?,?,?)`).run(sha256(code), request.clientId, request.redirectUri, googleSub,
-    request.scope, request.challenge, request.resource, now + AUTH_CODE_TTL_SECONDS);
+  await db.insert('oauth_codes', sha256(code), {
+    code_hash: sha256(code), client_id: request.clientId, redirect_uri: request.redirectUri,
+    google_sub: googleSub, scope: request.scope, code_challenge: request.challenge,
+    resource: request.resource, expires_at: now + AUTH_CODE_TTL_SECONDS,
+  });
   const redirect = safeRedirect(request.redirectUri);
   redirect.searchParams.set('code', code);
   redirect.searchParams.set('state', request.state);
@@ -114,7 +120,7 @@ function appendAuthorizationCode(db, config, request, googleSub, res) {
   res.redirect(302, redirect.toString());
 }
 
-function createClientRegistration(req, res, db, config) {
+async function createClientRegistration(req, res, db, config) {
   const payload = req.body || {};
   const redirectUris = payload.redirect_uris;
   const grantTypes = payload.grant_types || ['authorization_code'];
@@ -130,9 +136,10 @@ function createClientRegistration(req, res, db, config) {
   }
   const clientId = `bap_${randomToken(24)}`;
   const clientName = String(payload.client_name || 'ChatGPT custom connector').slice(0, 120);
-  db.prepare('INSERT INTO oauth_clients(client_id,client_name,redirect_uris_json,created_at) VALUES(?,?,?,?)')
-    .run(clientId, clientName, JSON.stringify(redirectUris), new Date().toISOString());
-  writeAudit(db, { event: 'oauth_client_registered', status: 'ok' });
+  await db.insert('oauth_clients', clientId, {
+    client_id: clientId, client_name: clientName, redirect_uris_json: JSON.stringify(redirectUris), created_at: new Date().toISOString(),
+  });
+  await writeAudit(db, { event: 'oauth_client_registered', status: 'ok' });
   return res.status(201).json({
     client_id: clientId,
     client_id_issued_at: Math.floor(Date.now() / 1000),
@@ -144,7 +151,7 @@ function createClientRegistration(req, res, db, config) {
   });
 }
 
-function issueTokens(db, grant) {
+async function issueTokens(db, grant) {
   const clientId = grant.clientId ?? grant.client_id;
   const googleSub = grant.googleSub ?? grant.google_sub;
   const scope = grant.scope;
@@ -154,13 +161,10 @@ function issueTokens(db, grant) {
   const now = Math.floor(Date.now() / 1000);
   const expiresAt = now + ACCESS_TOKEN_TTL_SECONDS;
   const refreshExpiresAt = now + REFRESH_TOKEN_TTL_SECONDS;
-  const insert = db.transaction(() => {
-    db.prepare(`INSERT INTO oauth_access_tokens(token_hash,client_id,google_sub,scope,resource,expires_at,created_at)
-      VALUES(?,?,?,?,?,?,?)`).run(sha256(accessToken), clientId, googleSub, scope, resource, expiresAt, new Date().toISOString());
-    db.prepare(`INSERT INTO oauth_refresh_tokens(token_hash,client_id,google_sub,scope,resource,expires_at,created_at)
-      VALUES(?,?,?,?,?,?,?)`).run(sha256(refreshToken), clientId, googleSub, scope, resource, refreshExpiresAt, new Date().toISOString());
-  });
-  insert();
+  const createdAt = new Date().toISOString();
+  const tokenData = { client_id: clientId, google_sub: googleSub, scope, resource, created_at: createdAt };
+  await db.insert('oauth_access_tokens', sha256(accessToken), { ...tokenData, expires_at: expiresAt });
+  await db.insert('oauth_refresh_tokens', sha256(refreshToken), { ...tokenData, expires_at: refreshExpiresAt });
   return { accessToken, refreshToken, expiresIn: ACCESS_TOKEN_TTL_SECONDS, scope };
 }
 
@@ -200,12 +204,12 @@ export function createOAuthMetadata(config) {
 export function createTokenVerifier(db, config) {
   return {
     async verifyAccessToken(token) {
-      const row = db.prepare('SELECT * FROM oauth_access_tokens WHERE token_hash=?').get(sha256(token));
+      const row = await db.get('oauth_access_tokens', sha256(token));
       const now = Math.floor(Date.now() / 1000);
       if (!row || row.expires_at <= now || row.resource !== config.resource) {
         throw new OAuthError(OAuthErrorCode.InvalidToken, 'Access token is invalid or expired.');
       }
-      const connection = getGoogleConnection(db);
+      const connection = await getGoogleConnection(db);
       if (!connection?.setup_complete || connection.google_sub !== row.google_sub || !connection.blog_id) {
         throw new OAuthError(OAuthErrorCode.InvalidToken, 'The Blogger account binding is no longer valid.');
       }
@@ -232,8 +236,8 @@ export function createOAuthRouter(db, config) {
     resourceName: 'Blogger AI Publisher',
   }));
 
-  router.get('/setup', (_req, res) => {
-    const connection = getGoogleConnection(db);
+  router.get('/setup', async (_req, res) => {
+    const connection = await getGoogleConnection(db);
     if (connection?.setup_complete) {
       return sendPage(res, htmlPage('Blogger AI Publisher setup is complete',
         `<p>Connected Google account: <strong>${escapeHtml(connection.email)}</strong></p><p>Authorized blog: <strong>${escapeHtml(connection.blog_name)}</strong></p><p>Blog ID: <code>${escapeHtml(connection.blog_id)}</code></p><p>The account and blog are fixed for this private installation.</p><form method="post" action="/setup/reconnect"><label>Setup code <input name="setup_code" type="password" required autocomplete="current-password"></label><button type="submit">Reconnect this Google account</button></form>`));
@@ -242,34 +246,34 @@ export function createOAuthRouter(db, config) {
     return sendPage(res, htmlPage('Connect Blogger', body));
   });
 
-  router.post('/setup/start', (req, res) => {
-    cleanupExpired(db);
-    if (getGoogleConnection(db)?.setup_complete) return sendPage(res, htmlPage('Setup already completed', '<p>This server is already bound to one Google account and one blog.</p>', 409));
+  router.post('/setup/start', async (req, res) => {
+    await cleanupExpired(db);
+    if ((await getGoogleConnection(db))?.setup_complete) return sendPage(res, htmlPage('Setup already completed', '<p>This server is already bound to one Google account and one blog.</p>', 409));
     const supplied = sha256(String(req.body?.setup_code || ''));
     if (!safeEqual(supplied, sha256(config.setupAdminSecret))) return sendPage(res, htmlPage('Invalid setup code', '<p>The setup code was not accepted.</p>', 401));
-    const url = createGoogleFlow(db, config, res, 'setup', null);
+    const url = await createGoogleFlow(db, config, res, 'setup', null);
     return res.redirect(302, url);
   });
 
-  router.post('/setup/reconnect', (req, res) => {
-    cleanupExpired(db);
-    if (!getGoogleConnection(db)?.setup_complete) {
+  router.post('/setup/reconnect', async (req, res) => {
+    await cleanupExpired(db);
+    if (!(await getGoogleConnection(db))?.setup_complete) {
       return sendPage(res, htmlPage('Complete initial setup first', '<p>Use the setup form to connect a Google account and select one blog.</p>', 409));
     }
     const supplied = sha256(String(req.body?.setup_code || ''));
     if (!safeEqual(supplied, sha256(config.setupAdminSecret))) return sendPage(res, htmlPage('Invalid setup code', '<p>The setup code was not accepted.</p>', 401));
-    const url = createGoogleFlow(db, config, res, 'reconnect', null);
+    const url = await createGoogleFlow(db, config, res, 'reconnect', null);
     return res.redirect(302, url);
   });
 
   router.post('/setup/select-blog', async (req, res) => {
     try {
-      const connection = getGoogleConnection(db);
+      const connection = await getGoogleConnection(db);
       const browser = req.cookies?.bap_setup_browser;
-      const savedCsrfHash = getSetting(db, 'setup_csrf_hash');
+      const savedCsrfHash = await getSetting(db, 'setup_csrf_hash');
       if (!connection || connection.setup_complete || !browser || !savedCsrfHash ||
           !safeEqual(sha256(String(req.body?.csrf || '')), savedCsrfHash) ||
-          !safeEqual(sha256(browser), getSetting(db, 'setup_browser_hash') || '')) {
+          !safeEqual(sha256(browser), (await getSetting(db, 'setup_browser_hash')) || '')) {
         return sendPage(res, htmlPage('Setup session expired', '<p>Restart Blogger setup and try again.</p>', 400));
       }
       const accessToken = connection.access_token_enc ? decryptText(connection.access_token_enc, config.encryptionKey) : null;
@@ -277,102 +281,102 @@ export function createOAuthRouter(db, config) {
       const blogs = await listBlogsWithAccessToken(accessToken);
       const selected = blogs.find(blog => blog.id === String(req.body?.blog_id || ''));
       if (!selected) return sendPage(res, htmlPage('Blog not found', '<p>Choose a blog returned by Blogger.</p>', 400));
-      db.prepare(`UPDATE google_connection SET blog_id=?,blog_name=?,blog_url=?,setup_complete=1 WHERE singleton=1`)
-        .run(selected.id, selected.name, selected.url);
-      db.prepare('DELETE FROM settings WHERE key IN (?,?)').run('setup_csrf_hash', 'setup_browser_hash');
+      await setGoogleConnection(db, { ...connection, blog_id: selected.id, blog_name: selected.name, blog_url: selected.url, setup_complete: 1 });
+      await deleteSetting(db, 'setup_csrf_hash');
+      await deleteSetting(db, 'setup_browser_hash');
       clearBrowserCookie(res, 'bap_setup_browser', config);
-      writeAudit(db, { event: 'google_account_bound', status: 'ok', blogId: selected.id });
+      await writeAudit(db, { event: 'google_account_bound', status: 'ok', blogId: selected.id });
       return sendPage(res, htmlPage('Blogger connected',
         `<p>Google account <strong>${escapeHtml(connection.email)}</strong> is now bound to <strong>${escapeHtml(selected.name)}</strong>.</p><p>Blog ID: <code>${escapeHtml(selected.id)}</code></p><p>Draft creation is available after the server is connected to ChatGPT. Public publishing is disabled by default.</p>`));
     } catch (error) {
-      writeAudit(db, { event: 'google_blog_selection', status: 'error', detail: error.message });
+      await writeAudit(db, { event: 'google_blog_selection', status: 'error', detail: error.message });
       return sendPage(res, htmlPage('Could not connect Blogger', '<p>Check server logs for the safe error reference, then retry setup.</p>', 500));
     }
   });
 
-  router.get('/oauth/authorize', (req, res) => {
-    cleanupExpired(db);
+  router.get('/oauth/authorize', async (req, res) => {
+    await cleanupExpired(db);
     try {
-      const client = db.prepare('SELECT * FROM oauth_clients WHERE client_id=?').get(readOne(req.query.client_id));
+      const client = await db.get('oauth_clients', readOne(req.query.client_id));
       const request = authRequestFromQuery(req.query, client, config);
-      const connection = getGoogleConnection(db);
+      const connection = await getGoogleConnection(db);
       if (!connection?.setup_complete || !connection.blog_id) {
         return sendPage(res, htmlPage('Complete Blogger setup first', '<p>Open the server’s /setup page, connect Google, and select the allowed blog before connecting this MCP server in ChatGPT.</p>', 409));
       }
-      return res.redirect(302, createGoogleFlow(db, config, res, 'login', request));
+      return res.redirect(302, await createGoogleFlow(db, config, res, 'login', request));
     } catch (error) {
-      writeAudit(db, { event: 'oauth_authorize', status: 'error', detail: error.message });
+      await writeAudit(db, { event: 'oauth_authorize', status: 'error', detail: error.message });
       return sendPage(res, htmlPage('Could not authorize this connection', `<p>${escapeHtml(error.message)}</p>`, 400));
     }
   });
 
   router.get('/oauth/google/callback', async (req, res) => {
-    cleanupExpired(db);
+    await cleanupExpired(db);
     const state = readOne(req.query.state);
     const code = readOne(req.query.code);
     if (req.query.error) return sendPage(res, htmlPage('Google authorization cancelled', '<p>Return to ChatGPT or the setup page and try again.</p>', 400));
-    const flow = state ? db.prepare('SELECT * FROM auth_flows WHERE state_hash=?').get(sha256(state)) : null;
+    const flow = state ? await db.get('auth_flows', sha256(state)) : null;
     if (!flow) return sendPage(res, htmlPage('Authorization request expired', '<p>Restart the connection flow.</p>', 400));
     const cookieName = flow.purpose === 'setup' ? 'bap_setup_browser' : 'bap_login_browser';
     const browser = req.cookies?.[cookieName];
     if (!browser || !safeEqual(sha256(browser), flow.browser_hash) || flow.expires_at < Math.floor(Date.now() / 1000)) {
-      db.prepare('DELETE FROM auth_flows WHERE state_hash=?').run(sha256(state));
+      await db.delete('auth_flows', sha256(state));
       return sendPage(res, htmlPage('Authorization session expired', '<p>Restart the connection flow in the same browser.</p>', 400));
     }
-    db.prepare('DELETE FROM auth_flows WHERE state_hash=?').run(sha256(state));
+    await db.delete('auth_flows', sha256(state));
     try {
       if (!code) throw new Error('Google did not return an authorization code.');
       const { tokens } = await oauth.getToken(code);
       if (!tokens.id_token) throw new Error('Google did not return an identity token. Check the configured OAuth scopes.');
       const identity = await verifyGoogleIdentity(config, tokens.id_token);
       if (flow.purpose === 'setup') {
-        if (getGoogleConnection(db)?.setup_complete) throw new Error('This server has already been configured.');
+        if ((await getGoogleConnection(db))?.setup_complete) throw new Error('This server has already been configured.');
         const blogs = await listBlogsWithAccessToken(tokens.access_token);
         if (!blogs.length) throw new Error('This Google account has no Blogger blogs available through the Blogger API.');
-        upsertGoogleConnection(db, config, identity, tokens);
+        await upsertGoogleConnection(db, config, identity, tokens);
         const csrf = randomToken(32);
-        setSetting(db, 'setup_csrf_hash', sha256(csrf));
-        setSetting(db, 'setup_browser_hash', flow.browser_hash);
+        await setSetting(db, 'setup_csrf_hash', sha256(csrf));
+        await setSetting(db, 'setup_browser_hash', flow.browser_hash);
         const options = blogs.map(blog => `<option value="${escapeHtml(blog.id)}">${escapeHtml(blog.name)} — ${escapeHtml(blog.url)}</option>`).join('');
         const body = `<p>Google account: <strong>${escapeHtml(identity.email)}</strong></p><p>Select the single blog this MCP server may access. This choice is enforced on every tool call.</p><form method="post" action="/setup/select-blog"><input type="hidden" name="csrf" value="${escapeHtml(csrf)}"><label>Blogger blog <select name="blog_id" required>${options}</select></label><button type="submit">Bind this blog</button></form>`;
         return sendPage(res, htmlPage('Select the authorized Blogger blog', body));
       }
 
       if (flow.purpose === 'reconnect') {
-        const connection = getGoogleConnection(db);
+        const connection = await getGoogleConnection(db);
         if (!connection?.setup_complete || identity.googleSub !== connection.google_sub) {
           throw new Error('Reconnect using the same Google account already bound to this Blogger server.');
         }
         const blogs = await listBlogsWithAccessToken(tokens.access_token);
         const boundBlog = blogs.find(blog => blog.id === String(connection.blog_id));
         if (!boundBlog) throw new Error('The bound blog is not available to this Google account. The account and Blog ID were left unchanged.');
-        refreshGoogleCredentials(db, config, tokens);
+        await refreshGoogleCredentials(db, config, tokens);
         clearBrowserCookie(res, cookieName, config);
-        writeAudit(db, { event: 'google_account_reconnected', status: 'ok', blogId: connection.blog_id });
+        await writeAudit(db, { event: 'google_account_reconnected', status: 'ok', blogId: connection.blog_id });
         return sendPage(res, htmlPage('Blogger reconnected', `<p>Google access was refreshed for <strong>${escapeHtml(connection.email)}</strong> and the existing Blog ID <code>${escapeHtml(connection.blog_id)}</code>.</p>`));
       }
 
-      const connection = getGoogleConnection(db);
+      const connection = await getGoogleConnection(db);
       if (!connection?.setup_complete || identity.googleSub !== connection.google_sub) {
         throw new Error('This Google account is not the one authorized for this private Blogger server.');
       }
       const request = JSON.parse(flow.request_json || '{}');
       if (!request.clientId || !request.redirectUri || !request.challenge) throw new Error('Stored OAuth request is invalid.');
       clearBrowserCookie(res, cookieName, config);
-      writeAudit(db, { event: 'oauth_user_authorized', status: 'ok', blogId: connection.blog_id });
-      return appendAuthorizationCode(db, config, request, identity.googleSub, res);
+      await writeAudit(db, { event: 'oauth_user_authorized', status: 'ok', blogId: connection.blog_id });
+      return await appendAuthorizationCode(db, config, request, identity.googleSub, res);
     } catch (error) {
-      writeAudit(db, { event: 'google_oauth_callback', status: 'error', detail: error.message });
+      await writeAudit(db, { event: 'google_oauth_callback', status: 'error', detail: error.message });
       return sendPage(res, htmlPage('Google authorization failed', `<p>${escapeHtml(error.message)}</p>`, 400));
     }
   });
 
-  router.post('/oauth/register', (req, res) => createClientRegistration(req, res, db, config));
+  router.post('/oauth/register', async (req, res) => createClientRegistration(req, res, db, config));
 
-  router.post('/oauth/token', (req, res) => {
-    cleanupExpired(db);
+  router.post('/oauth/token', async (req, res) => {
+    await cleanupExpired(db);
     const { grant_type: grantType, client_id: clientId, resource } = req.body || {};
-    const client = db.prepare('SELECT * FROM oauth_clients WHERE client_id=?').get(clientId);
+    const client = await db.get('oauth_clients', clientId);
     if (!client || resource !== config.resource) return tokenError(res, 'invalid_client', 'The client or resource is invalid.');
     const now = Math.floor(Date.now() / 1000);
     if (grantType === 'authorization_code') {
@@ -380,28 +384,30 @@ export function createOAuthRouter(db, config) {
       const redirectUri = String(req.body.redirect_uri || '');
       const verifier = String(req.body.code_verifier || '');
       if (!/^[A-Za-z0-9._~-]{43,128}$/.test(verifier)) return tokenError(res);
-      const row = db.prepare('SELECT * FROM oauth_codes WHERE code_hash=?').get(sha256(code));
+      const codeHash = sha256(code);
+      const row = await db.get('oauth_codes', codeHash);
       if (!row || row.expires_at <= now || row.client_id !== clientId || row.redirect_uri !== redirectUri || row.resource !== resource) return tokenError(res);
       const expectedChallenge = createHash('sha256').update(verifier).digest('base64url');
       if (!safeEqual(expectedChallenge, row.code_challenge)) return tokenError(res);
-      db.prepare('DELETE FROM oauth_codes WHERE code_hash=?').run(sha256(code));
-      const tokens = issueTokens(db, row);
-      writeAudit(db, { event: 'oauth_code_exchanged', status: 'ok' });
+      const claimed = await db.insert('used_auth_codes', codeHash, { expires_at: now + AUTH_CODE_TTL_SECONDS });
+      if (!claimed) return tokenError(res);
+      await db.delete('oauth_codes', codeHash);
+      const tokens = await issueTokens(db, row);
+      await writeAudit(db, { event: 'oauth_code_exchanged', status: 'ok' });
       return tokenResponse(res, tokens);
     }
 
     if (grantType === 'refresh_token') {
       const refresh = String(req.body.refresh_token || '');
       const hash = sha256(refresh);
-      const row = db.prepare('SELECT * FROM oauth_refresh_tokens WHERE token_hash=?').get(hash);
+      const row = await db.get('oauth_refresh_tokens', hash);
       if (!row || row.expires_at <= now || row.client_id !== clientId || row.resource !== resource) return tokenError(res);
-      const rotate = db.transaction(() => {
-        db.prepare('DELETE FROM oauth_refresh_tokens WHERE token_hash=?').run(hash);
-        return issueTokens(db, row);
-      });
       try {
-        const tokens = rotate();
-        writeAudit(db, { event: 'oauth_refresh', status: 'ok' });
+        const claimed = await db.insert('used_refresh_tokens', hash, { expires_at: row.expires_at });
+        if (!claimed) return tokenError(res);
+        await db.delete('oauth_refresh_tokens', hash);
+        const tokens = await issueTokens(db, row);
+        await writeAudit(db, { event: 'oauth_refresh', status: 'ok' });
         return tokenResponse(res, tokens);
       } catch {
         return tokenError(res);
@@ -410,11 +416,13 @@ export function createOAuthRouter(db, config) {
     return tokenError(res, 'unsupported_grant_type', 'Only authorization_code and refresh_token are supported.');
   });
 
-  router.post('/oauth/revoke', (req, res) => {
+  router.post('/oauth/revoke', async (req, res) => {
     const clientId = String(req.body.client_id || '');
     const tokenHash = sha256(String(req.body.token || ''));
-    db.prepare('DELETE FROM oauth_access_tokens WHERE token_hash=? AND client_id=?').run(tokenHash, clientId);
-    db.prepare('DELETE FROM oauth_refresh_tokens WHERE token_hash=? AND client_id=?').run(tokenHash, clientId);
+    for (const collection of ['oauth_access_tokens', 'oauth_refresh_tokens']) {
+      const row = await db.get(collection, tokenHash);
+      if (row?.client_id === clientId) await db.delete(collection, tokenHash);
+    }
     return res.status(200).end();
   });
 
