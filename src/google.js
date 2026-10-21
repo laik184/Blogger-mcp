@@ -1,6 +1,6 @@
 import { OAuth2Client } from 'google-auth-library';
 import { decryptText, encryptText } from './crypto.js';
-import { getGoogleConnection, writeAudit } from './db.js';
+import { getGoogleConnection, setGoogleConnection, writeAudit } from './db.js';
 
 const BLOGGER_API = 'https://www.googleapis.com/blogger/v3';
 const TOKEN_ENDPOINT = 'https://oauth2.googleapis.com/token';
@@ -33,40 +33,41 @@ export async function listBlogsWithAccessToken(accessToken) {
   return (data.items || []).map(blog => ({ id: String(blog.id), name: blog.name || blog.title || 'Untitled blog', url: blog.url || '' }));
 }
 
-export function upsertGoogleConnection(db, config, identity, credentials) {
+export async function upsertGoogleConnection(db, config, identity, credentials) {
   if (!credentials.refresh_token) {
     throw new Error('Google did not issue a refresh token. Revoke this app in Google Account security, then repeat setup and approve offline access.');
   }
-  const statement = db.prepare(`INSERT INTO google_connection
-    (singleton,google_sub,email,display_name,refresh_token_enc,access_token_enc,token_expiry,connected_at,setup_complete)
-    VALUES(1,@googleSub,@email,@displayName,@refreshTokenEnc,@accessTokenEnc,@tokenExpiry,@connectedAt,0)
-    ON CONFLICT(singleton) DO UPDATE SET
-      google_sub=excluded.google_sub,email=excluded.email,display_name=excluded.display_name,
-      refresh_token_enc=excluded.refresh_token_enc,access_token_enc=excluded.access_token_enc,
-      token_expiry=excluded.token_expiry,connected_at=excluded.connected_at,setup_complete=0,
-      blog_id=NULL,blog_name=NULL,blog_url=NULL`);
-  statement.run({
-    ...identity,
-    refreshTokenEnc: encryptText(credentials.refresh_token, config.encryptionKey),
-    accessTokenEnc: credentials.access_token ? encryptText(credentials.access_token, config.encryptionKey) : null,
-    tokenExpiry: credentials.expiry_date || null,
-    connectedAt: new Date().toISOString(),
+  await setGoogleConnection(db, {
+    google_sub: identity.googleSub,
+    email: identity.email,
+    display_name: identity.displayName,
+    refresh_token_enc: encryptText(credentials.refresh_token, config.encryptionKey),
+    access_token_enc: credentials.access_token ? encryptText(credentials.access_token, config.encryptionKey) : null,
+    token_expiry: credentials.expiry_date || null,
+    connected_at: new Date().toISOString(),
+    setup_complete: 0,
+    blog_id: null,
+    blog_name: null,
+    blog_url: null,
   });
 }
 
-export function refreshGoogleCredentials(db, config, credentials) {
-  const connection = getGoogleConnection(db);
+export async function refreshGoogleCredentials(db, config, credentials) {
+  const connection = await getGoogleConnection(db);
   if (!connection?.setup_complete || !connection.blog_id) {
     throw new Error('The Blogger connection is not set up yet.');
   }
   if (!credentials.access_token) throw new Error('Google did not return an access token.');
-  db.prepare(`UPDATE google_connection SET access_token_enc=?, token_expiry=?, refresh_token_enc=? WHERE singleton=1`)
-    .run(encryptText(credentials.access_token, config.encryptionKey), credentials.expiry_date || null,
-      credentials.refresh_token ? encryptText(credentials.refresh_token, config.encryptionKey) : connection.refresh_token_enc);
+  await setGoogleConnection(db, {
+    ...connection,
+    access_token_enc: encryptText(credentials.access_token, config.encryptionKey),
+    token_expiry: credentials.expiry_date || null,
+    refresh_token_enc: credentials.refresh_token ? encryptText(credentials.refresh_token, config.encryptionKey) : connection.refresh_token_enc,
+  });
 }
 
 export async function getFreshAccessToken(db, config) {
-  const connection = getGoogleConnection(db);
+  const connection = await getGoogleConnection(db);
   if (!connection?.setup_complete || !connection.blog_id) throw new Error('Blogger is not connected. Complete the one-time setup first.');
   if (connection.access_token_enc && connection.token_expiry && connection.token_expiry > Date.now() + 60_000) {
     return decryptText(connection.access_token_enc, config.encryptionKey);
@@ -87,12 +88,15 @@ export async function getFreshAccessToken(db, config) {
   });
   const data = await response.json().catch(() => ({}));
   if (!response.ok || !data.access_token) {
-    writeAudit(db, { event: 'google_refresh', status: 'error', blogId: connection.blog_id, detail: data.error || `HTTP ${response.status}` });
+    await writeAudit(db, { event: 'google_refresh', status: 'error', blogId: connection.blog_id, detail: data.error || `HTTP ${response.status}` });
     throw new Error('Google authorization expired or was revoked. Reconnect Blogger from the setup page.');
   }
-  db.prepare(`UPDATE google_connection SET access_token_enc=?, token_expiry=?, refresh_token_enc=? WHERE singleton=1`)
-    .run(encryptText(data.access_token, config.encryptionKey), Date.now() + (Number(data.expires_in || 3600) * 1000),
-      data.refresh_token ? encryptText(data.refresh_token, config.encryptionKey) : connection.refresh_token_enc);
+  await setGoogleConnection(db, {
+    ...connection,
+    access_token_enc: encryptText(data.access_token, config.encryptionKey),
+    token_expiry: Date.now() + (Number(data.expires_in || 3600) * 1000),
+    refresh_token_enc: data.refresh_token ? encryptText(data.refresh_token, config.encryptionKey) : connection.refresh_token_enc,
+  });
   return data.access_token;
 }
 
@@ -131,7 +135,7 @@ export async function bloggerRequest(db, config, { method = 'GET', path, query, 
 }
 
 export async function listAuthorizedBlogs(db, config) {
-  const connection = getGoogleConnection(db);
+  const connection = await getGoogleConnection(db);
   if (!connection?.setup_complete) return [];
   const data = await bloggerRequest(db, config, { path: '/users/self/blogs' });
   return (data.items || [])
